@@ -5,8 +5,9 @@ from aiogram import Router, F
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import DELETE_DELAY_SECONDS, WHITELIST_BOT_IDS
+from config import WHITELIST_BOT_IDS
 from jobs import delete_message_job
+from storage import get_delay
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,8 @@ def register_handlers(scheduler: AsyncIOScheduler) -> Router:
         if message.bot and user_id == message.bot.id:
             return
 
-        run_date = datetime.now() + timedelta(seconds=DELETE_DELAY_SECONDS)
+        delay_seconds = get_delay(message.chat.id)
+        run_date = datetime.now() + timedelta(seconds=delay_seconds)
         # id задачи привязан к чату и сообщению — защищает от дублей
         job_id = f"del_{message.chat.id}_{message.message_id}"
 
