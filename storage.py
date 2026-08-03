@@ -43,6 +43,63 @@ def set_delay(chat_id: int, delay_seconds: int) -> None:
         conn.commit()
 
 
+def _ensure_whitelist_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_whitelist (
+            chat_id INTEGER NOT NULL,
+            bot_id INTEGER NOT NULL,
+            username TEXT,
+            PRIMARY KEY (chat_id, bot_id)
+        )
+        """
+    )
+
+
+def add_whitelist(chat_id: int, bot_id: int, username: str | None) -> None:
+    with closing(_get_conn()) as conn:
+        _ensure_whitelist_table(conn)
+        conn.execute(
+            """
+            INSERT INTO chat_whitelist (chat_id, bot_id, username)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id, bot_id) DO UPDATE SET username = excluded.username
+            """,
+            (chat_id, bot_id, username),
+        )
+        conn.commit()
+
+
+def remove_whitelist(chat_id: int, bot_id: int) -> None:
+    with closing(_get_conn()) as conn:
+        _ensure_whitelist_table(conn)
+        conn.execute(
+            "DELETE FROM chat_whitelist WHERE chat_id = ? AND bot_id = ?",
+            (chat_id, bot_id),
+        )
+        conn.commit()
+
+
+def list_whitelist(chat_id: int) -> list[tuple[int, str | None]]:
+    with closing(_get_conn()) as conn:
+        _ensure_whitelist_table(conn)
+        rows = conn.execute(
+            "SELECT bot_id, username FROM chat_whitelist WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchall()
+    return rows
+
+
+def is_chat_whitelisted(chat_id: int, bot_id: int) -> bool:
+    with closing(_get_conn()) as conn:
+        _ensure_whitelist_table(conn)
+        row = conn.execute(
+            "SELECT 1 FROM chat_whitelist WHERE chat_id = ? AND bot_id = ?",
+            (chat_id, bot_id),
+        ).fetchone()
+    return row is not None
+
+
 def parse_delay(text: str) -> int | None:
     """
     Разбирает пользовательский ввод в секунды.
