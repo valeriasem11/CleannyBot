@@ -8,6 +8,7 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import BOT_TOKEN, JOBS_DB_PATH
+from commands import router as commands_router
 from handlers import register_handlers
 
 logging.basicConfig(
@@ -30,6 +31,7 @@ async def main() -> None:
     scheduler = AsyncIOScheduler(jobstores=jobstores)
     scheduler.start()
 
+    dp.include_router(commands_router)
     dp.include_router(register_handlers(scheduler))
 
     me = await bot.get_me()
