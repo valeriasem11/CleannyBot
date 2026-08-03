@@ -9,6 +9,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import BOT_TOKEN, JOBS_DB_PATH
 from commands import router as commands_router
+from debug_log import router as debug_router
 from handlers import register_handlers
 
 logging.basicConfig(
@@ -33,6 +34,7 @@ async def main() -> None:
 
     dp.include_router(commands_router)
     dp.include_router(register_handlers(scheduler))
+    dp.include_router(debug_router)
 
     me = await bot.get_me()
     logger.info("Cleanny запущен как @%s", me.username)
