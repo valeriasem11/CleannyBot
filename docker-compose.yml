@@ -1,0 +1,9 @@
+services:
+  cleanny:
+    build: .
+    container_name: cleanny-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

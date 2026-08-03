@@ -1,0 +1,20 @@
+[Unit]
+Description=Cleanny Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Замените на пользователя, от имени которого должен работать бот
+User=cleanny
+# Укажите реальный путь к папке проекта на сервере
+WorkingDirectory=/opt/cleanny-bot
+ExecStart=/opt/cleanny-bot/venv/bin/python /opt/cleanny-bot/bot.py
+Restart=always
+RestartSec=5
+# Если .env лежит рядом с bot.py, EnvironmentFile не обязателен —
+# python-dotenv прочитает его сам. Но можно и явно указать:
+# EnvironmentFile=/opt/cleanny-bot/.env
+
+[Install]
+WantedBy=multi-user.target
