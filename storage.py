@@ -100,6 +100,75 @@ def is_chat_whitelisted(chat_id: int, bot_id: int) -> bool:
     return row is not None
 
 
+def _ensure_known_chats_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS known_chats (
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def upsert_known_chat_status(
+    chat_id: int, title: str, status: str, updated_at: str
+) -> None:
+    """Достоверное обновление (из события my_chat_member) — статус точный."""
+    with closing(_get_conn()) as conn:
+        _ensure_known_chats_table(conn)
+        conn.execute(
+            """
+            INSERT INTO known_chats (chat_id, title, status, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE
+                SET title = excluded.title,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+            """,
+            (chat_id, title, status, updated_at),
+        )
+        conn.commit()
+
+
+def upsert_known_chat_passive(chat_id: int, title: str, updated_at: str) -> None:
+    """
+    Пассивное обновление — вызывается на каждое обычное сообщение.
+    Если чат уже известен, статус не трогаем (сохраняем последний
+    достоверный из my_chat_member). Если чат новый — считаем, что бот
+    как минимум участник ('member').
+    """
+    with closing(_get_conn()) as conn:
+        _ensure_known_chats_table(conn)
+        row = conn.execute(
+            "SELECT status FROM known_chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        status = row[0] if row else "member"
+        conn.execute(
+            """
+            INSERT INTO known_chats (chat_id, title, status, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE
+                SET title = excluded.title,
+                    updated_at = excluded.updated_at
+            """,
+            (chat_id, title, status, updated_at),
+        )
+        conn.commit()
+
+
+def list_known_chats() -> list[tuple[int, str, str, str]]:
+    with closing(_get_conn()) as conn:
+        _ensure_known_chats_table(conn)
+        rows = conn.execute(
+            "SELECT chat_id, title, status, updated_at FROM known_chats "
+            "ORDER BY updated_at DESC"
+        ).fetchall()
+    return rows
+
+
 def parse_delay(text: str) -> int | None:
     """
     Разбирает пользовательский ввод в секунды.

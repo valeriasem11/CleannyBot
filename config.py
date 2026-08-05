@@ -19,6 +19,9 @@ WHITELIST_BOT_IDS = {
     int(x.strip()) for x in _whitelist_raw.split(",") if x.strip()
 }
 
+# ID владельца бота — только этому пользователю доступна команда /chats
+OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "828533150"))
+
 # Файл SQLite, где APScheduler хранит запланированные задачи
 # (переживают перезапуск бота)
 JOBS_DB_PATH = os.getenv("JOBS_DB_PATH", "jobs.sqlite")

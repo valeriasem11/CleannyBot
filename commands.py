@@ -1,14 +1,15 @@
-from aiogram import Router
+from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
-from config import WHITELIST_BOT_IDS
+from config import OWNER_USER_ID, WHITELIST_BOT_IDS
 from storage import (
     MAX_DELAY_SECONDS,
     MIN_DELAY_SECONDS,
     add_whitelist,
     format_delay,
     get_delay,
+    list_known_chats,
     list_whitelist,
     parse_delay,
     remove_whitelist,
@@ -220,3 +221,41 @@ async def cmd_whitelist(message: Message, command: CommandObject) -> None:
         "Также можно ответить командой на сообщение бота вместо "
         "указания юзернейма."
     )
+
+
+_ACTIVE_STATUSES = {"member", "administrator", "creator"}
+
+
+@router.message(Command("chats"), F.chat.type == "private")
+async def cmd_chats(message: Message) -> None:
+    # Команда личная — молча игнорируем всех, кроме владельца,
+    # чтобы не палить наличие команды посторонним
+    if message.from_user is None or message.from_user.id != OWNER_USER_ID:
+        return
+
+    chats = list_known_chats()
+    if not chats:
+        await message.answer("Пока не знаю ни одного чата — бот ещё нигде не отметился.")
+        return
+
+    header = f"🤖 Беседы, где известен бот ({len(chats)})"
+    entries = []
+    for chat_id, title, status, updated_at in chats:
+        emoji = "✅" if status in _ACTIVE_STATUSES else "❌"
+        entries.append(
+            f"{emoji} <b>{title}</b>\n"
+            f"ID: <code>{chat_id}</code> · статус: {status} · обновлено: {updated_at}"
+        )
+
+    # Разбиваем на несколько сообщений, если список большой
+    # (лимит Telegram на одно сообщение — 4096 символов)
+    chunk = header
+    for entry in entries:
+        candidate = f"{chunk}\n\n{entry}"
+        if len(candidate) > 3500:
+            await message.answer(chunk)
+            chunk = entry
+        else:
+            chunk = candidate
+    if chunk:
+        await message.answer(chunk)

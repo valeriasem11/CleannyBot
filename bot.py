@@ -8,6 +8,8 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import BOT_TOKEN, JOBS_DB_PATH
+from chat_tracker import ChatTrackerMiddleware
+from chat_tracker import router as chat_tracker_router
 from commands import router as commands_router
 from debug_log import router as debug_router
 from handlers import register_handlers
@@ -32,6 +34,9 @@ async def main() -> None:
     scheduler = AsyncIOScheduler(jobstores=jobstores)
     scheduler.start()
 
+    dp.update.outer_middleware(ChatTrackerMiddleware())
+
+    dp.include_router(chat_tracker_router)
     dp.include_router(commands_router)
     dp.include_router(register_handlers(scheduler))
     dp.include_router(debug_router)
