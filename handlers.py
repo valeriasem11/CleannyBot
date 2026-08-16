@@ -7,7 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import WHITELIST_BOT_IDS
 from jobs import delete_message_job
-from storage import get_delay, is_chat_whitelisted
+from storage import get_delay, is_chat_whitelisted, is_paused
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,10 @@ def register_handlers(scheduler: AsyncIOScheduler) -> Router:
 
         # Не трогаем самого себя (Cleanny)
         if message.bot and user_id == message.bot.id:
+            return
+
+        # Не трогаем ничего, если в этом чате сейчас включена пауза
+        if is_paused(message.chat.id):
             return
 
         delay_seconds = get_delay(message.chat.id)

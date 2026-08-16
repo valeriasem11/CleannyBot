@@ -7,7 +7,7 @@ from aiogram.enums import ParseMode
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import BOT_TOKEN, JOBS_DB_PATH
+from config import BOT_TOKEN, DATABASE_URL
 from chat_tracker import ChatTrackerMiddleware
 from chat_tracker import router as chat_tracker_router
 from commands import router as commands_router
@@ -28,9 +28,9 @@ async def main() -> None:
     )
     dp = Dispatcher()
 
-    # Задачи хранятся в SQLite — если бот перезапустится,
-    # запланированные удаления не потеряются
-    jobstores = {"default": SQLAlchemyJobStore(url=f"sqlite:///{JOBS_DB_PATH}")}
+    # Задачи хранятся в БД (Postgres на bothost или локальный SQLite) —
+    # переживают перезапуск и передеплой
+    jobstores = {"default": SQLAlchemyJobStore(url=DATABASE_URL)}
     scheduler = AsyncIOScheduler(jobstores=jobstores)
     scheduler.start()
 

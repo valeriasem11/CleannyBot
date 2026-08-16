@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
@@ -7,13 +9,16 @@ from storage import (
     MAX_DELAY_SECONDS,
     MIN_DELAY_SECONDS,
     add_whitelist,
+    clear_pause,
     format_delay,
     get_delay,
+    get_pause_until,
     list_known_chats,
     list_whitelist,
     parse_delay,
     remove_whitelist,
     set_delay,
+    set_pause,
 )
 
 router = Router()
@@ -39,7 +44,10 @@ HELP_TEXT = (
     "/setdelay &lt;время&gt; — изменить задержку перед удалением "
     "(только для админов группы)\n"
     "/whitelist add|remove|list — управлять списком ботов, которых "
-    "не нужно чистить (только для админов группы)\n\n"
+    "не нужно чистить (только для админов группы)\n"
+    "/pause &lt;время&gt; — временно приостановить удаление в этом чате "
+    "(только для админов группы)\n"
+    "/resume — досрочно снять паузу (только для админов группы)\n\n"
     "<b>Примеры /setdelay:</b>\n"
     "/setdelay 2 — 2 минуты\n"
     "/setdelay 30s — 30 секунд\n"
@@ -50,6 +58,10 @@ HELP_TEXT = (
     "/whitelist list\n"
     "Также можно ответить командой /whitelist add на сообщение бота — "
     "тогда юзернейм указывать не нужно.\n\n"
+    "<b>Примеры /pause:</b>\n"
+    "/pause 10 — приостановить на 10 минут\n"
+    "/pause 30s — приостановить на 30 секунд\n"
+    "/pause 1h — приостановить на 1 час\n\n"
     "Cleanny не реагирует на обычные сообщения людей — он только следит "
     "за сообщениями от других ботов в группах, где у него есть права "
     "администратора, и удаляет их с задержкой."
@@ -73,12 +85,22 @@ async def cmd_status(message: Message) -> None:
     if message.chat.type in ("group", "supergroup"):
         delay = get_delay(message.chat.id)
         delay_line = f"⏱ Задержка удаления в этом чате: {format_delay(delay)}"
+
+        pause_until = get_pause_until(message.chat.id)
+        if pause_until:
+            pause_line = (
+                f"\n⏸ Бот на паузе до {pause_until.strftime('%d.%m.%Y %H:%M')} "
+                "(удаление сообщений от ботов сейчас отключено)"
+            )
+        else:
+            pause_line = ""
     else:
         delay_line = "⏱ Задержка удаления: настраивается отдельно в каждой группе (/setdelay)"
+        pause_line = ""
 
     text = (
         "<b>Текущие настройки Cleanny</b>\n\n"
-        f"{delay_line}\n"
+        f"{delay_line}{pause_line}\n"
         f"🚫 Вайтлист ботов (их сообщения не трогаю): {whitelist}"
     )
     await message.answer(text)
@@ -224,6 +246,50 @@ async def cmd_whitelist(message: Message, command: CommandObject) -> None:
 
 
 _ACTIVE_STATUSES = {"member", "administrator", "creator"}
+
+
+@router.message(Command("pause"))
+async def cmd_pause(message: Message, command: CommandObject) -> None:
+    if not await _check_is_admin(message):
+        return
+
+    if not command.args:
+        await message.answer(
+            "Укажите время. Примеры:\n"
+            "/pause 10 — 10 минут\n"
+            "/pause 30s — 30 секунд\n"
+            "/pause 1h — 1 час"
+        )
+        return
+
+    seconds = parse_delay(command.args)
+    if seconds is None or seconds <= 0:
+        await message.answer(
+            "Не понял формат. Примеры: /pause 10 (минуты), "
+            "/pause 30s (секунды), /pause 1h (часы)"
+        )
+        return
+
+    until = datetime.now() + timedelta(seconds=seconds)
+    set_pause(message.chat.id, until)
+    await message.answer(
+        f"⏸ Готово! Cleanny приостановлен в этом чате до "
+        f"{until.strftime('%d.%m.%Y %H:%M')} — сообщения от ботов "
+        "удаляться не будут.\n\nЧтобы включить раньше — /resume."
+    )
+
+
+@router.message(Command("resume"))
+async def cmd_resume(message: Message) -> None:
+    if not await _check_is_admin(message):
+        return
+
+    if get_pause_until(message.chat.id) is None:
+        await message.answer("Бот и так сейчас не на паузе в этом чате.")
+        return
+
+    clear_pause(message.chat.id)
+    await message.answer("▶️ Готово! Cleanny снова активен в этом чате.")
 
 
 @router.message(Command("chats"), F.chat.type == "private")

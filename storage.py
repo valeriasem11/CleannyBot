@@ -1,173 +1,242 @@
-import sqlite3
-from contextlib import closing
+from datetime import datetime
 
-from config import JOBS_DB_PATH, DELETE_DELAY_SECONDS
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+from config import DATABASE_URL, DELETE_DELAY_SECONDS
 
 # Ограничение самого Telegram: нельзя удалить сообщение старше 48 часов
 MAX_DELAY_SECONDS = 48 * 60 * 60
 MIN_DELAY_SECONDS = 5
 
+TIME_FORMAT = "%d.%m.%Y %H:%M"
 
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(JOBS_DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chat_settings (
-            chat_id INTEGER PRIMARY KEY,
-            delay_seconds INTEGER NOT NULL
+engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+
+
+def _init_db() -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS chat_settings (
+                    chat_id BIGINT PRIMARY KEY,
+                    delay_seconds INTEGER NOT NULL
+                )
+                """
+            )
         )
-        """
-    )
-    return conn
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS chat_whitelist (
+                    chat_id BIGINT NOT NULL,
+                    bot_id BIGINT NOT NULL,
+                    username TEXT,
+                    PRIMARY KEY (chat_id, bot_id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS known_chats (
+                    chat_id BIGINT PRIMARY KEY,
+                    title TEXT,
+                    status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS chat_pause (
+                    chat_id BIGINT PRIMARY KEY,
+                    paused_until TIMESTAMP NOT NULL
+                )
+                """
+            )
+        )
 
+
+_init_db()
+
+
+# ---------- Задержка удаления (per-chat) ----------
 
 def get_delay(chat_id: int) -> int:
-    """Возвращает задержку для конкретного чата, либо значение по умолчанию из .env."""
-    with closing(_get_conn()) as conn:
+    with engine.begin() as conn:
         row = conn.execute(
-            "SELECT delay_seconds FROM chat_settings WHERE chat_id = ?", (chat_id,)
+            text("SELECT delay_seconds FROM chat_settings WHERE chat_id = :chat_id"),
+            {"chat_id": chat_id},
         ).fetchone()
     return row[0] if row else DELETE_DELAY_SECONDS
 
 
 def set_delay(chat_id: int, delay_seconds: int) -> None:
-    with closing(_get_conn()) as conn:
+    with engine.begin() as conn:
         conn.execute(
-            """
-            INSERT INTO chat_settings (chat_id, delay_seconds)
-            VALUES (?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET delay_seconds = excluded.delay_seconds
-            """,
-            (chat_id, delay_seconds),
+            text(
+                """
+                INSERT INTO chat_settings (chat_id, delay_seconds)
+                VALUES (:chat_id, :delay)
+                ON CONFLICT (chat_id) DO UPDATE SET delay_seconds = :delay
+                """
+            ),
+            {"chat_id": chat_id, "delay": delay_seconds},
         )
-        conn.commit()
 
 
-def _ensure_whitelist_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chat_whitelist (
-            chat_id INTEGER NOT NULL,
-            bot_id INTEGER NOT NULL,
-            username TEXT,
-            PRIMARY KEY (chat_id, bot_id)
-        )
-        """
-    )
-
+# ---------- Вайтлист ботов (per-chat) ----------
 
 def add_whitelist(chat_id: int, bot_id: int, username: str | None) -> None:
-    with closing(_get_conn()) as conn:
-        _ensure_whitelist_table(conn)
+    with engine.begin() as conn:
         conn.execute(
-            """
-            INSERT INTO chat_whitelist (chat_id, bot_id, username)
-            VALUES (?, ?, ?)
-            ON CONFLICT(chat_id, bot_id) DO UPDATE SET username = excluded.username
-            """,
-            (chat_id, bot_id, username),
+            text(
+                """
+                INSERT INTO chat_whitelist (chat_id, bot_id, username)
+                VALUES (:chat_id, :bot_id, :username)
+                ON CONFLICT (chat_id, bot_id) DO UPDATE SET username = :username
+                """
+            ),
+            {"chat_id": chat_id, "bot_id": bot_id, "username": username},
         )
-        conn.commit()
 
 
 def remove_whitelist(chat_id: int, bot_id: int) -> None:
-    with closing(_get_conn()) as conn:
-        _ensure_whitelist_table(conn)
+    with engine.begin() as conn:
         conn.execute(
-            "DELETE FROM chat_whitelist WHERE chat_id = ? AND bot_id = ?",
-            (chat_id, bot_id),
+            text("DELETE FROM chat_whitelist WHERE chat_id = :chat_id AND bot_id = :bot_id"),
+            {"chat_id": chat_id, "bot_id": bot_id},
         )
-        conn.commit()
 
 
 def list_whitelist(chat_id: int) -> list[tuple[int, str | None]]:
-    with closing(_get_conn()) as conn:
-        _ensure_whitelist_table(conn)
+    with engine.begin() as conn:
         rows = conn.execute(
-            "SELECT bot_id, username FROM chat_whitelist WHERE chat_id = ?",
-            (chat_id,),
+            text("SELECT bot_id, username FROM chat_whitelist WHERE chat_id = :chat_id"),
+            {"chat_id": chat_id},
         ).fetchall()
-    return rows
+    return [(r[0], r[1]) for r in rows]
 
 
 def is_chat_whitelisted(chat_id: int, bot_id: int) -> bool:
-    with closing(_get_conn()) as conn:
-        _ensure_whitelist_table(conn)
+    with engine.begin() as conn:
         row = conn.execute(
-            "SELECT 1 FROM chat_whitelist WHERE chat_id = ? AND bot_id = ?",
-            (chat_id, bot_id),
+            text(
+                "SELECT 1 FROM chat_whitelist WHERE chat_id = :chat_id AND bot_id = :bot_id"
+            ),
+            {"chat_id": chat_id, "bot_id": bot_id},
         ).fetchone()
     return row is not None
 
 
-def _ensure_known_chats_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS known_chats (
-            chat_id INTEGER PRIMARY KEY,
-            title TEXT,
-            status TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
+# ---------- Известные боту чаты ----------
 
-
-def upsert_known_chat_status(
-    chat_id: int, title: str, status: str, updated_at: str
-) -> None:
+def upsert_known_chat_status(chat_id: int, title: str, status: str, updated_at: str) -> None:
     """Достоверное обновление (из события my_chat_member) — статус точный."""
-    with closing(_get_conn()) as conn:
-        _ensure_known_chats_table(conn)
+    with engine.begin() as conn:
         conn.execute(
-            """
-            INSERT INTO known_chats (chat_id, title, status, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id) DO UPDATE
-                SET title = excluded.title,
-                    status = excluded.status,
-                    updated_at = excluded.updated_at
-            """,
-            (chat_id, title, status, updated_at),
+            text(
+                """
+                INSERT INTO known_chats (chat_id, title, status, updated_at)
+                VALUES (:chat_id, :title, :status, :updated_at)
+                ON CONFLICT (chat_id) DO UPDATE
+                    SET title = :title, status = :status, updated_at = :updated_at
+                """
+            ),
+            {"chat_id": chat_id, "title": title, "status": status, "updated_at": updated_at},
         )
-        conn.commit()
 
 
 def upsert_known_chat_passive(chat_id: int, title: str, updated_at: str) -> None:
-    """
-    Пассивное обновление — вызывается на каждое обычное сообщение.
-    Если чат уже известен, статус не трогаем (сохраняем последний
-    достоверный из my_chat_member). Если чат новый — считаем, что бот
-    как минимум участник ('member').
-    """
-    with closing(_get_conn()) as conn:
-        _ensure_known_chats_table(conn)
+    """Пассивное обновление на каждое сообщение — статус не трогаем, если чат уже известен."""
+    with engine.begin() as conn:
         row = conn.execute(
-            "SELECT status FROM known_chats WHERE chat_id = ?", (chat_id,)
+            text("SELECT status FROM known_chats WHERE chat_id = :chat_id"),
+            {"chat_id": chat_id},
         ).fetchone()
         status = row[0] if row else "member"
         conn.execute(
-            """
-            INSERT INTO known_chats (chat_id, title, status, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id) DO UPDATE
-                SET title = excluded.title,
-                    updated_at = excluded.updated_at
-            """,
-            (chat_id, title, status, updated_at),
+            text(
+                """
+                INSERT INTO known_chats (chat_id, title, status, updated_at)
+                VALUES (:chat_id, :title, :status, :updated_at)
+                ON CONFLICT (chat_id) DO UPDATE
+                    SET title = :title, updated_at = :updated_at
+                """
+            ),
+            {"chat_id": chat_id, "title": title, "status": status, "updated_at": updated_at},
         )
-        conn.commit()
 
 
 def list_known_chats() -> list[tuple[int, str, str, str]]:
-    with closing(_get_conn()) as conn:
-        _ensure_known_chats_table(conn)
+    with engine.begin() as conn:
         rows = conn.execute(
-            "SELECT chat_id, title, status, updated_at FROM known_chats "
-            "ORDER BY updated_at DESC"
+            text("SELECT chat_id, title, status, updated_at FROM known_chats ORDER BY updated_at DESC")
         ).fetchall()
-    return rows
+    return [(r[0], r[1], r[2], r[3]) for r in rows]
 
+
+# ---------- Временная пауза (per-chat) ----------
+
+def set_pause(chat_id: int, until: datetime) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO chat_pause (chat_id, paused_until)
+                VALUES (:chat_id, :until)
+                ON CONFLICT (chat_id) DO UPDATE SET paused_until = :until
+                """
+            ),
+            {"chat_id": chat_id, "until": until},
+        )
+
+
+def clear_pause(chat_id: int) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM chat_pause WHERE chat_id = :chat_id"),
+            {"chat_id": chat_id},
+        )
+
+
+def get_pause_until(chat_id: int) -> datetime | None:
+    """
+    Возвращает время окончания паузы, если чат сейчас на паузе,
+    иначе None. Если пауза уже истекла — тихо подчищает запись.
+    """
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT paused_until FROM chat_pause WHERE chat_id = :chat_id"),
+            {"chat_id": chat_id},
+        ).fetchone()
+        if row is None:
+            return None
+
+        paused_until = row[0]
+        if isinstance(paused_until, str):
+            paused_until = datetime.fromisoformat(paused_until)
+
+        if paused_until <= datetime.now():
+            conn.execute(
+                text("DELETE FROM chat_pause WHERE chat_id = :chat_id"),
+                {"chat_id": chat_id},
+            )
+            return None
+
+        return paused_until
+
+
+def is_paused(chat_id: int) -> bool:
+    return get_pause_until(chat_id) is not None
+
+
+# ---------- Разбор пользовательского ввода времени ----------
 
 def parse_delay(text: str) -> int | None:
     """

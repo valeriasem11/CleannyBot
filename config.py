@@ -22,6 +22,10 @@ WHITELIST_BOT_IDS = {
 # ID владельца бота — только этому пользователю доступна команда /chats
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "828533150"))
 
-# Файл SQLite, где APScheduler хранит запланированные задачи
-# (переживают перезапуск бота)
+# Строка подключения к базе данных.
+# На bothost — возьмите connection string вашего PostgreSQL из панели
+# и пропишите его сюда как DATABASE_URL. Если переменная не задана —
+# используется локальный SQLite-файл (удобно для разработки на своём
+# компьютере, но НЕ переживает передеплой на облачных платформах).
 JOBS_DB_PATH = os.getenv("JOBS_DB_PATH", "jobs.sqlite")
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{JOBS_DB_PATH}")
