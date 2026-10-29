@@ -1,305 +1,479 @@
-from datetime import datetime, timedelta
+import html
+import re
+from datetime import timedelta
 
-from aiogram import Router, F
+from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
-from config import OWNER_USER_ID, WHITELIST_BOT_IDS
-from storage import (
-    MAX_DELAY_SECONDS,
-    MIN_DELAY_SECONDS,
-    add_whitelist,
-    clear_pause,
-    format_delay,
-    get_delay,
-    get_pause_until,
-    list_known_chats,
-    list_whitelist,
-    parse_delay,
-    remove_whitelist,
-    set_delay,
-    set_pause,
+import storage as st
+from config import DEFAULT_UTC_OFFSET_HOURS, OWNER_USER_ID, TIDY_DELAY_SECONDS, WHITELIST_BOT_IDS
+from utils import (
+    GROUP_TYPES,
+    UNKNOWN_BOT_TEXT,
+    check_admin,
+    fmt_local,
+    format_duration,
+    offset_label,
+    parse_duration,
+    parse_hm,
+    parse_utc_offset,
+    reply,
+    resolve_bot,
 )
 
 router = Router()
 
+MAX_PAUSE_SECONDS = 30 * 24 * 3600
+ON_WORDS = {"on", "1", "yes", "вкл", "включить", "да"}
+OFF_WORDS = {"off", "0", "no", "выкл", "выключить", "нет"}
+CANCEL_WORDS = {"cancel", "all", "отмена", "сброс"}
+ACTIVE_STATUSES = {"member", "administrator", "creator"}
+
 WELCOME_TEXT = (
-    "👋 Привет! Я <b>Cleanny</b> — бот для чистки чата от сообщений других ботов.\n\n"
-    "<b>Как я работаю:</b>\n"
-    "Слежу за сообщениями в группе. Если сообщение написал бот (не человек) — "
-    "я автоматически удаляю его через заданное время (по умолчанию 5 мин, "
-    "можно настроить через /setdelay).\n\n"
-    "<b>Чтобы я заработал в группе, нужно:</b>\n"
-    "1. Добавить меня в группу.\n"
-    "2. Назначить администратором с правом «Удаление сообщений».\n"
-    "3. Всё — дальше я работаю автоматически, ничего писать не нужно.\n\n"
-    "Список команд: /help"
+    "👋 Привет! Я <b>Cleanny</b> — убираю из чата сообщения других ботов.\n\n"
+    "<b>Как это работает</b>\n"
+    "Если в группе пишет бот, я удаляю его сообщение через заданное время "
+    "(по умолчанию 5 минут).\n\n"
+    "<b>Чтобы я заработал</b>\n"
+    "1. Добавьте меня в группу.\n"
+    "2. Назначьте администратором с правом «Удаление сообщений».\n"
+    "3. Дальше я работаю сам. Настройки — команда /settings (для админов группы).\n\n"
+    "Все команды: /help"
 )
 
 HELP_TEXT = (
     "<b>Команды Cleanny</b>\n\n"
-    "/start — приветствие и краткая инструкция\n"
-    "/help — список команд (то, что вы видите сейчас)\n"
-    "/status — текущие настройки бота в этом чате\n"
-    "/setdelay &lt;время&gt; — изменить задержку перед удалением "
-    "(только для админов группы)\n"
-    "/whitelist add|remove|list — управлять списком ботов, которых "
-    "не нужно чистить (только для админов группы)\n"
-    "/pause &lt;время&gt; — временно приостановить удаление в этом чате "
-    "(только для админов группы)\n"
-    "/resume — досрочно снять паузу (только для админов группы)\n\n"
-    "<b>Примеры /setdelay:</b>\n"
-    "/setdelay 2 — 2 минуты\n"
-    "/setdelay 30s — 30 секунд\n"
-    "/setdelay 1h — 1 час\n\n"
-    "<b>Примеры /whitelist:</b>\n"
-    "/whitelist add @CoupleStoryBot\n"
-    "/whitelist remove @CoupleStoryBot\n"
-    "/whitelist list\n"
-    "Также можно ответить командой /whitelist add на сообщение бота — "
-    "тогда юзернейм указывать не нужно.\n\n"
-    "<b>Примеры /pause:</b>\n"
-    "/pause 10 — приостановить на 10 минут\n"
-    "/pause 30s — приостановить на 30 секунд\n"
-    "/pause 1h — приостановить на 1 час\n\n"
-    "Cleanny не реагирует на обычные сообщения людей — он только следит "
-    "за сообщениями от других ботов в группах, где у него есть права "
-    "администратора, и удаляет их с задержкой."
+    "<b>Для всех</b>\n"
+    "/start — приветствие\n"
+    "/help — эта справка\n"
+    "/status — настройки этого чата\n\n"
+    "<b>Для админов группы</b>\n"
+    "/settings — меню настроек с кнопками\n"
+    "/setdelay &lt;время&gt; — через сколько удалять сообщения ботов\n"
+    "/botdelay &lt;@бот&gt; &lt;время|reset&gt; — своя задержка для конкретного бота\n"
+    "/pause &lt;время&gt; [cancel] — пауза (cancel — ещё и отменить уже запланированные удаления)\n"
+    "/resume — снять паузу\n"
+    "/keep — ответом на сообщение бота: оставить его\n"
+    "/whitelist add|remove|list — боты, которых не трогаем\n"
+    "/mode all|only — чистить всех или только ботов из /targets\n"
+    "/targets add|remove|list — список ботов для режима only\n"
+    "/cleancmds on|off — удалять и команды людей к ботам (/cmd@bot)\n"
+    "/cleanvia on|off — удалять сообщения, отправленные через inline-режим\n"
+    f"/tidy on|off — убирать мои ответы и команды админов через ~{TIDY_DELAY_SECONDS} сек\n"
+    "/night 23:00-08:00 [skip|fast] | off — ночной режим\n"
+    "/timezone +5 — часовой пояс чата\n"
+    "/stats — статистика удалений\n\n"
+    "<b>Формат времени:</b> 30s, 10m, 2h, 1d; число без буквы — минуты.\n"
+    "<b>Выбрать бота</b> можно по @username (если он уже писал там, где я есть) "
+    "или ответом на его сообщение."
 )
 
 
+# ---------- Базовые ----------
+
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
-    await message.answer(WELCOME_TEXT)
+    await reply(message, WELCOME_TEXT)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    await reply(message, HELP_TEXT)
 
 
 @router.message(Command("status"))
 async def cmd_status(message: Message) -> None:
-    whitelist = ", ".join(str(x) for x in WHITELIST_BOT_IDS) or "пусто"
+    if message.chat.type not in GROUP_TYPES:
+        await reply(message, "Настройки задаются отдельно в каждой группе — откройте /status в нужном чате.")
+        return
 
-    if message.chat.type in ("group", "supergroup"):
-        delay = get_delay(message.chat.id)
-        delay_line = f"⏱ Задержка удаления в этом чате: {format_delay(delay)}"
+    chat_id = message.chat.id
+    opts = st.get_options(chat_id)
+    offset = int(opts["utc_offset"])
+    onoff = lambda key: "вкл" if st.option_on(opts, key) else "выкл"  # noqa: E731
 
-        pause_until = get_pause_until(message.chat.id)
-        if pause_until:
-            pause_line = (
-                f"\n⏸ Бот на паузе до {pause_until.strftime('%d.%m.%Y %H:%M')} "
-                "(удаление сообщений от ботов сейчас отключено)"
-            )
-        else:
-            pause_line = ""
-    else:
-        delay_line = "⏱ Задержка удаления: настраивается отдельно в каждой группе (/setdelay)"
-        pause_line = ""
+    lines = [
+        "<b>Настройки Cleanny в этом чате</b>",
+        "",
+        f"⏱ Задержка удаления: {format_duration(st.get_delay(chat_id))}",
+        "🎯 Режим: " + ("чистить всех, кроме вайтлиста" if opts["mode"] == "all" else "только боты из /targets"),
+    ]
+    pause = st.get_pause_until(chat_id)
+    if pause:
+        lines.append(f"⏸ На паузе до {fmt_local(pause, offset)} ({offset_label(offset)})")
+    if opts["night_start"] and opts["night_end"]:
+        action = "не удаляю" if opts["night_action"] == "skip" else f"удаляю быстро (~{format_duration(30)})"
+        lines.append(f"🌙 Ночной режим {opts['night_start']}–{opts['night_end']}: {action}")
+    lines += [
+        f"🧹 Команды к ботам: {onoff('clean_commands')}",
+        f"📎 Сообщения через inline-режим: {onoff('clean_via')}",
+        f"🧽 Убирать мои ответы: {onoff('tidy')}",
+        f"🕒 Часовой пояс: {offset_label(offset)}",
+        f"🚫 Вайтлист: {len(st.list_get('whitelist', chat_id))} · целей: {len(st.list_get('targets', chat_id))}"
+        f" · отдельных задержек: {len(st.list_bot_delays(chat_id))}",
+        f"📬 В очереди на удаление: {st.pending_count(chat_id)}",
+    ]
+    if WHITELIST_BOT_IDS:
+        lines.append(f"Общий вайтлист (для всех чатов): {len(WHITELIST_BOT_IDS)} бот(ов)")
+    await reply(message, "\n".join(lines))
 
-    text = (
-        "<b>Текущие настройки Cleanny</b>\n\n"
-        f"{delay_line}{pause_line}\n"
-        f"🚫 Вайтлист ботов (их сообщения не трогаю): {whitelist}"
-    )
-    await message.answer(text)
+
+# ---------- Задержка и пауза ----------
+
+def _validate_delay(seconds: int | None) -> str | None:
+    if seconds is None:
+        return "Не понял формат. Примеры: 5 (минуты), 30s, 10m, 2h."
+    if seconds < st.MIN_DELAY_SECONDS:
+        return f"Минимальная задержка — {st.MIN_DELAY_SECONDS} сек."
+    if seconds > st.MAX_DELAY_SECONDS:
+        return "Telegram не позволяет удалять сообщения старше 48 часов — поставьте поменьше."
+    return None
 
 
 @router.message(Command("setdelay"))
 async def cmd_setdelay(message: Message, command: CommandObject) -> None:
-    if message.chat.type not in ("group", "supergroup"):
-        await message.answer("Эта команда работает только в группах.")
+    if not await check_admin(message):
         return
-
-    member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
-    if member.status not in ("administrator", "creator"):
-        await message.answer("Менять задержку может только администратор группы.")
-        return
-
     if not command.args:
-        await message.answer(
-            "Укажите время. Примеры:\n"
-            "/setdelay 2 — 2 минуты\n"
-            "/setdelay 30s — 30 секунд\n"
-            "/setdelay 1h — 1 час"
-        )
+        await reply(message, "Укажите время, например: /setdelay 2 (минуты), /setdelay 30s, /setdelay 1h")
         return
-
-    delay = parse_delay(command.args)
-    if delay is None:
-        await message.answer(
-            "Не понял формат. Примеры: /setdelay 5 (минуты), "
-            "/setdelay 30s (секунды), /setdelay 1h (часы)"
-        )
+    seconds = parse_duration(command.args)
+    error = _validate_delay(seconds)
+    if error:
+        await reply(message, error)
         return
-
-    if delay < MIN_DELAY_SECONDS:
-        await message.answer(f"Минимальная задержка — {MIN_DELAY_SECONDS} сек.")
-        return
-
-    if delay > MAX_DELAY_SECONDS:
-        await message.answer(
-            "Telegram не позволяет удалять сообщения старше 48 часов — "
-            "поставьте значение поменьше."
-        )
-        return
-
-    set_delay(message.chat.id, delay)
-    await message.answer(
-        f"✅ Готово! Теперь сообщения от ботов в этом чате будут "
-        f"удаляться через {format_delay(delay)}."
-    )
-
-
-async def _check_is_admin(message: Message) -> bool:
-    if message.chat.type not in ("group", "supergroup"):
-        await message.answer("Эта команда работает только в группах.")
-        return False
-
-    member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
-    if member.status not in ("administrator", "creator"):
-        await message.answer("Управлять вайтлистом может только администратор группы.")
-        return False
-
-    return True
-
-
-@router.message(Command("whitelist"))
-async def cmd_whitelist(message: Message, command: CommandObject) -> None:
-    if not await _check_is_admin(message):
-        return
-
-    args = (command.args or "").strip().split(maxsplit=1)
-    action = args[0].lower() if args else ""
-
-    if action == "list":
-        entries = list_whitelist(message.chat.id)
-        if not entries:
-            await message.answer(
-                "Вайтлист этого чата пуст.\n"
-                "Также действует общий вайтлист из настроек хостинга "
-                "(WHITELIST_BOT_IDS)."
-            )
-        else:
-            lines = "\n".join(
-                f"• @{username}" if username else f"• ID {bot_id}"
-                for bot_id, username in entries
-            )
-            await message.answer(f"<b>Боты в вайтлисте этого чата:</b>\n{lines}")
-        return
-
-    if action in ("add", "remove"):
-        target_id: int | None = None
-        target_username: str | None = None
-
-        if message.reply_to_message and message.reply_to_message.from_user:
-            replied_user = message.reply_to_message.from_user
-            if not replied_user.is_bot:
-                await message.answer("Это сообщение не от бота.")
-                return
-            target_id = replied_user.id
-            target_username = replied_user.username
-        elif len(args) > 1:
-            username = args[1].strip().lstrip("@")
-            try:
-                chat = await message.bot.get_chat(f"@{username}")
-            except Exception:
-                await message.answer(
-                    f"Не нашла бота с юзернеймом @{username}. Проверьте "
-                    "написание, либо ответьте этой командой на сообщение "
-                    "бота вместо указания юзернейма."
-                )
-                return
-            target_id = chat.id
-            target_username = chat.username or username
-        else:
-            await message.answer(
-                "Укажите юзернейм бота или ответьте этой командой на его "
-                "сообщение.\nПример: /whitelist add @CoupleStoryBot"
-            )
-            return
-
-        display_name = f"@{target_username}" if target_username else str(target_id)
-
-        if action == "add":
-            add_whitelist(message.chat.id, target_id, target_username)
-            await message.answer(
-                f"✅ Бот {display_name} добавлен в вайтлист этого чата — "
-                "его сообщения больше не будут удаляться."
-            )
-        else:
-            remove_whitelist(message.chat.id, target_id)
-            await message.answer(
-                f"🗑 Бот {display_name} убран из вайтлиста этого чата."
-            )
-        return
-
-    await message.answer(
-        "<b>Использование:</b>\n"
-        "/whitelist add @username — добавить бота в вайтлист\n"
-        "/whitelist remove @username — убрать бота из вайтлиста\n"
-        "/whitelist list — показать текущий список\n\n"
-        "Также можно ответить командой на сообщение бота вместо "
-        "указания юзернейма."
-    )
-
-
-_ACTIVE_STATUSES = {"member", "administrator", "creator"}
+    st.set_delay(message.chat.id, seconds)
+    await reply(message, f"✅ Готово! Сообщения ботов в этом чате будут удаляться через {format_duration(seconds)}.")
 
 
 @router.message(Command("pause"))
 async def cmd_pause(message: Message, command: CommandObject) -> None:
-    if not await _check_is_admin(message):
+    if not await check_admin(message):
         return
-
-    if not command.args:
-        await message.answer(
-            "Укажите время. Примеры:\n"
-            "/pause 10 — 10 минут\n"
-            "/pause 30s — 30 секунд\n"
-            "/pause 1h — 1 час"
+    tokens = (command.args or "").split()
+    cancel = any(t.lower() in CANCEL_WORDS for t in tokens)
+    duration_text = " ".join(t for t in tokens if t.lower() not in CANCEL_WORDS)
+    if not duration_text:
+        await reply(
+            message,
+            "Укажите время: /pause 10 (минуты), /pause 30s, /pause 1h.\n"
+            "Добавьте cancel, чтобы заодно отменить уже запланированные удаления: /pause 1h cancel",
         )
         return
-
-    seconds = parse_delay(command.args)
-    if seconds is None or seconds <= 0:
-        await message.answer(
-            "Не понял формат. Примеры: /pause 10 (минуты), "
-            "/pause 30s (секунды), /pause 1h (часы)"
-        )
+    seconds = parse_duration(duration_text)
+    if seconds is None or seconds <= 0 or seconds > MAX_PAUSE_SECONDS:
+        await reply(message, "Не понял время (максимум — 30 дней). Примеры: /pause 10, /pause 2h, /pause 1d")
         return
 
-    until = datetime.now() + timedelta(seconds=seconds)
-    set_pause(message.chat.id, until)
-    await message.answer(
-        f"⏸ Готово! Cleanny приостановлен в этом чате до "
-        f"{until.strftime('%d.%m.%Y %H:%M')} — сообщения от ботов "
-        "удаляться не будут.\n\nЧтобы включить раньше — /resume."
-    )
+    chat_id = message.chat.id
+    until = st.utcnow() + timedelta(seconds=seconds)
+    st.set_pause(chat_id, until)
+    cancelled = st.cancel_chat_deletions(chat_id) if cancel else 0
+    offset = int(st.get_options(chat_id)["utc_offset"])
+    text = f"⏸ Пауза до {fmt_local(until, offset)} ({offset_label(offset)}). Новые сообщения ботов удаляться не будут."
+    if cancel:
+        text += f"\nОтменено уже запланированных удалений: {cancelled}."
+    else:
+        text += "\nУже запланированные удаления сработают. Чтобы отменить и их — /pause ... cancel."
+    text += "\nСнять паузу раньше: /resume."
+    await reply(message, text)
 
 
 @router.message(Command("resume"))
 async def cmd_resume(message: Message) -> None:
-    if not await _check_is_admin(message):
+    if not await check_admin(message):
+        return
+    if st.get_pause_until(message.chat.id) is None:
+        await reply(message, "Бот и так сейчас не на паузе.")
+        return
+    st.clear_pause(message.chat.id)
+    await reply(message, "▶️ Готово! Cleanny снова удаляет сообщения ботов.")
+
+
+# ---------- Списки ботов: whitelist / targets ----------
+
+async def _manage_list(message: Message, command: CommandObject, kind: str, title: str, cmd: str) -> None:
+    if not await check_admin(message):
+        return
+    chat_id = message.chat.id
+    parts = (command.args or "").split(maxsplit=1)
+    action = parts[0].lower() if parts else ""
+    token = parts[1].strip() if len(parts) > 1 else None
+
+    if action == "list":
+        entries = st.list_get(kind, chat_id)
+        if not entries:
+            await reply(message, f"{title} этого чата пуст.")
+            return
+        lines = "\n".join(f"• @{u}" if u else f"• ID {b}" for b, u in entries)
+        await reply(message, f"<b>{title} этого чата:</b>\n{lines}")
         return
 
-    if get_pause_until(message.chat.id) is None:
-        await message.answer("Бот и так сейчас не на паузе в этом чате.")
+    if action in ("add", "remove"):
+        target = await resolve_bot(message, token)
+        if target is None:
+            await reply(message, UNKNOWN_BOT_TEXT if token else f"Укажите бота: /{cmd} {action} @username — или ответьте командой на его сообщение.")
+            return
+        bot_id, username = target
+        name = f"@{username}" if username else f"ID {bot_id}"
+        if action == "add":
+            st.list_add(kind, chat_id, bot_id, username)
+            text = f"✅ {html.escape(name)} добавлен в список «{title.lower()}» этого чата."
+            if kind == "whitelist":
+                cancelled = st.cancel_bot_deletions(chat_id, bot_id)
+                text += " Его сообщения больше не удаляются."
+                if cancelled:
+                    text += f" Отменено уже запланированных удалений: {cancelled}."
+            await reply(message, text)
+        else:
+            st.list_remove(kind, chat_id, bot_id)
+            await reply(message, f"🗑 {html.escape(name)} убран из списка «{title.lower()}».")
         return
 
-    clear_pause(message.chat.id)
-    await message.answer("▶️ Готово! Cleanny снова активен в этом чате.")
+    await reply(
+        message,
+        f"<b>Использование:</b>\n/{cmd} add @username — добавить\n/{cmd} remove @username — убрать\n"
+        f"/{cmd} list — показать список\nМожно ответить командой на сообщение бота вместо @username.",
+    )
 
+
+@router.message(Command("whitelist"))
+async def cmd_whitelist(message: Message, command: CommandObject) -> None:
+    await _manage_list(message, command, "whitelist", "Вайтлист", "whitelist")
+
+
+@router.message(Command("targets"))
+async def cmd_targets(message: Message, command: CommandObject) -> None:
+    await _manage_list(message, command, "targets", "Цели", "targets")
+
+
+@router.message(Command("mode"))
+async def cmd_mode(message: Message, command: CommandObject) -> None:
+    if not await check_admin(message):
+        return
+    arg = (command.args or "").strip().lower()
+    if arg not in ("all", "only"):
+        current = st.get_options(message.chat.id)["mode"]
+        await reply(
+            message,
+            f"Сейчас: <b>{current}</b>.\n/mode all — чистить всех ботов, кроме вайтлиста\n"
+            "/mode only — чистить только ботов из списка /targets",
+        )
+        return
+    st.set_option(message.chat.id, "mode", arg)
+    if arg == "only":
+        await reply(message, "🎯 Режим «only»: чищу только ботов из /targets. Добавить: /targets add @бот")
+    else:
+        await reply(message, "🎯 Режим «all»: чищу всех ботов, кроме вайтлиста.")
+
+
+@router.message(Command("botdelay"))
+async def cmd_botdelay(message: Message, command: CommandObject) -> None:
+    if not await check_admin(message):
+        return
+    chat_id = message.chat.id
+    tokens = (command.args or "").split()
+
+    if tokens and tokens[0].lower() == "list":
+        entries = st.list_bot_delays(chat_id)
+        if not entries:
+            await reply(message, "Отдельных задержек нет — все боты удаляются с общей задержкой.")
+            return
+        lines = "\n".join(f"• {'@' + u if u else 'ID ' + str(b)} — {format_duration(s)}" for b, u, s in entries)
+        await reply(message, f"<b>Отдельные задержки:</b>\n{lines}")
+        return
+
+    rep = message.reply_to_message
+    replying_to_bot = bool(rep and ((rep.from_user and rep.from_user.is_bot) or rep.via_bot))
+    if replying_to_bot:
+        token, time_token = None, " ".join(tokens)
+    elif tokens:
+        token, time_token = tokens[0], " ".join(tokens[1:])
+    else:
+        token, time_token = None, ""
+
+    if not time_token:
+        await reply(
+            message,
+            "Использование:\n/botdelay @бот 10 — удалять этого бота через 10 минут\n"
+            "/botdelay @бот reset — вернуть общую задержку\n/botdelay list — показать все\n"
+            "Можно ответить командой на сообщение бота и не указывать @бот.",
+        )
+        return
+
+    target = await resolve_bot(message, token)
+    if target is None:
+        await reply(message, UNKNOWN_BOT_TEXT)
+        return
+    bot_id, username = target
+    name = html.escape(f"@{username}" if username else f"ID {bot_id}")
+
+    if time_token.lower() in ("reset", "сброс", "off"):
+        removed = st.remove_bot_delay(chat_id, bot_id)
+        await reply(message, f"↩️ Для {name} снова общая задержка." if removed else f"Для {name} не было отдельной задержки.")
+        return
+
+    seconds = parse_duration(time_token)
+    error = _validate_delay(seconds)
+    if error:
+        await reply(message, error)
+        return
+    st.set_bot_delay(chat_id, bot_id, username, seconds)
+    await reply(message, f"✅ Сообщения {name} будут удаляться через {format_duration(seconds)}.")
+
+
+# ---------- Переключатели ----------
+
+async def _toggle(message: Message, command: CommandObject, key: str, title: str, hint: str) -> None:
+    if not await check_admin(message):
+        return
+    chat_id = message.chat.id
+    arg = (command.args or "").strip().lower()
+    current = st.option_on(st.get_options(chat_id), key)
+    if arg in ON_WORDS:
+        new = True
+    elif arg in OFF_WORDS:
+        new = False
+    else:
+        await reply(message, f"{title}: сейчас <b>{'включено' if current else 'выключено'}</b>.\nВключить: on · выключить: off.\n{hint}")
+        return
+    st.set_option(chat_id, key, "1" if new else "0")
+    await reply(message, f"{title}: {'включено ✅' if new else 'выключено ⛔️'}")
+
+
+@router.message(Command("cleancmds"))
+async def cmd_cleancmds(message: Message, command: CommandObject) -> None:
+    await _toggle(
+        message, command, "clean_commands", "Удаление команд к ботам",
+        "Удаляются команды вида /команда@бот (с @). Команды без @ и обычные слова вроде «ферма» определить нельзя.",
+    )
+
+
+@router.message(Command("cleanvia"))
+async def cmd_cleanvia(message: Message, command: CommandObject) -> None:
+    await _toggle(
+        message, command, "clean_via", "Удаление сообщений через inline-режим",
+        "Это сообщения, которые человек отправил через @бота (в них есть пометка «via @бот»).",
+    )
+
+
+@router.message(Command("tidy"))
+async def cmd_tidy(message: Message, command: CommandObject) -> None:
+    await _toggle(
+        message, command, "tidy", "Авто-уборка моих ответов",
+        f"Мои ответы и команды админов убираются примерно через {TIDY_DELAY_SECONDS} сек.",
+    )
+
+
+# ---------- Ночной режим и часовой пояс ----------
+
+_NIGHT_RE = re.compile(r"(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})")
+
+
+@router.message(Command("night"))
+async def cmd_night(message: Message, command: CommandObject) -> None:
+    if not await check_admin(message):
+        return
+    chat_id = message.chat.id
+    arg = (command.args or "").strip()
+    opts = st.get_options(chat_id)
+
+    if arg.lower() in ("off", "выкл", "0"):
+        st.set_option(chat_id, "night_start", "")
+        st.set_option(chat_id, "night_end", "")
+        await reply(message, "🌙 Ночной режим выключен.")
+        return
+
+    m = _NIGHT_RE.search(arg)
+    if not m or parse_hm(m.group(1)) is None or parse_hm(m.group(2)) is None:
+        current = (
+            f"Сейчас: {opts['night_start']}–{opts['night_end']} ({opts['night_action']})."
+            if opts["night_start"] else "Сейчас выключен."
+        )
+        await reply(
+            message,
+            f"🌙 {current}\n/night 23:00-08:00 — не удалять ночью (skip)\n"
+            "/night 23:00-08:00 fast — ночью удалять быстро\n/night off — выключить\n"
+            f"Время считается по поясу чата: {offset_label(int(opts['utc_offset']))} (/timezone).",
+        )
+        return
+
+    action = "fast" if "fast" in arg.lower() else "skip"
+    start, end = m.group(1), m.group(2)
+    st.set_option(chat_id, "night_start", f"{int(start.split(':')[0]):02d}:{start.split(':')[1]}")
+    st.set_option(chat_id, "night_end", f"{int(end.split(':')[0]):02d}:{end.split(':')[1]}")
+    st.set_option(chat_id, "night_action", action)
+    what = "сообщения ботов не удаляются" if action == "skip" else "сообщения ботов удаляются быстро"
+    await reply(message, f"🌙 Ночной режим {start}–{end} ({offset_label(int(opts['utc_offset']))}): {what}.")
+
+
+@router.message(Command("timezone"))
+async def cmd_timezone(message: Message, command: CommandObject) -> None:
+    if not await check_admin(message):
+        return
+    chat_id = message.chat.id
+    arg = (command.args or "").strip()
+    if not arg:
+        offset = int(st.get_options(chat_id)["utc_offset"])
+        await reply(message, f"🕒 Часовой пояс чата: {offset_label(offset)}.\nИзменить: /timezone +5 (Екатеринбург), /timezone +3 (Москва).")
+        return
+    minutes = parse_utc_offset(arg)
+    if minutes is None:
+        await reply(message, "Не понял. Пример: /timezone +5 или /timezone -3 или /timezone +5:30")
+        return
+    st.set_option(chat_id, "utc_offset", str(minutes))
+    await reply(message, f"🕒 Часовой пояс чата: {offset_label(minutes)}.")
+
+
+# ---------- Статистика ----------
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    if message.chat.type in GROUP_TYPES:
+        if not await check_admin(message):
+            return
+        chat_id = message.chat.id
+        offset = int(st.get_options(chat_id)["utc_offset"])
+        scope = "этот чат"
+    else:
+        if not message.from_user or message.from_user.id != OWNER_USER_ID:
+            return
+        chat_id = None
+        offset = int(DEFAULT_UTC_OFFSET_HOURS * 60)
+        scope = "все чаты"
+
+    now = st.utcnow()
+    local_midnight = (now + timedelta(minutes=offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+    since_today = local_midnight - timedelta(minutes=offset)
+    since_week = now - timedelta(days=7)
+    since_month = now - timedelta(days=30)
+
+    lines = [
+        f"📊 <b>Статистика Cleanny</b> ({scope})",
+        "",
+        f"Сегодня: {st.count_deleted(chat_id, since_today)}",
+        f"За 7 дней: {st.count_deleted(chat_id, since_week)}",
+        f"За 30 дней: {st.count_deleted(chat_id, since_month)}",
+    ]
+    top = st.top_bots(chat_id, since_week)
+    if top:
+        lines += ["", "<b>Кого чищу чаще всего (7 дней):</b>"]
+        for i, (name, n) in enumerate(top, 1):
+            label = name if name.isdigit() else f"@{name}"
+            lines.append(f"{i}. {html.escape(label)} — {n}")
+    lines += ["", f"В очереди сейчас: {st.pending_count(chat_id)}", "<i>Считаются сообщения, отправленные на удаление.</i>"]
+    await reply(message, "\n".join(lines))
+
+
+# ---------- Личная команда владельца ----------
 
 @router.message(Command("chats"), F.chat.type == "private")
 async def cmd_chats(message: Message) -> None:
-    # Команда личная — молча игнорируем всех, кроме владельца,
-    # чтобы не палить наличие команды посторонним
     if message.from_user is None or message.from_user.id != OWNER_USER_ID:
-        return
+        return  # молча игнорируем посторонних
 
-    chats = list_known_chats()
+    chats = st.list_known_chats()
     if not chats:
         await message.answer("Пока не знаю ни одного чата — бот ещё нигде не отметился.")
         return
@@ -307,14 +481,12 @@ async def cmd_chats(message: Message) -> None:
     header = f"🤖 Беседы, где известен бот ({len(chats)})"
     entries = []
     for chat_id, title, status, updated_at in chats:
-        emoji = "✅" if status in _ACTIVE_STATUSES else "❌"
+        emoji = "✅" if status in ACTIVE_STATUSES else "❌"
         entries.append(
-            f"{emoji} <b>{title}</b>\n"
+            f"{emoji} <b>{html.escape(title or str(chat_id))}</b>\n"
             f"ID: <code>{chat_id}</code> · статус: {status} · обновлено: {updated_at}"
         )
 
-    # Разбиваем на несколько сообщений, если список большой
-    # (лимит Telegram на одно сообщение — 4096 символов)
     chunk = header
     for entry in entries:
         candidate = f"{chunk}\n\n{entry}"

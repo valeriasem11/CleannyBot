@@ -4,15 +4,16 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import BOT_TOKEN, DATABASE_URL
+import storage as st
+from alerts import notify_owner, on_error, run_watchdog
 from chat_tracker import ChatTrackerMiddleware
 from chat_tracker import router as chat_tracker_router
 from commands import router as commands_router
-from debug_log import router as debug_router
-from handlers import register_handlers
+from config import BOT_TOKEN
+from handlers import router as handlers_router
+from queue_worker import run_worker
+from settings_ui import router as settings_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,26 +29,29 @@ async def main() -> None:
     )
     dp = Dispatcher()
 
-    # Задачи хранятся в БД (Postgres на bothost или локальный SQLite) —
-    # переживают перезапуск и передеплой
-    jobstores = {"default": SQLAlchemyJobStore(url=DATABASE_URL)}
-    scheduler = AsyncIOScheduler(jobstores=jobstores)
-    scheduler.start()
-
     dp.update.outer_middleware(ChatTrackerMiddleware())
+    dp.errors.register(on_error)
 
+    # Порядок важен: команды и настройки раньше общего слежения за группами
     dp.include_router(chat_tracker_router)
     dp.include_router(commands_router)
-    dp.include_router(register_handlers(scheduler))
-    dp.include_router(debug_router)
+    dp.include_router(settings_router)
+    dp.include_router(handlers_router)
 
     me = await bot.get_me()
     logger.info("Cleanny запущен как @%s", me.username)
+    await notify_owner(bot, f"✅ Cleanny запущен (@{me.username}). В очереди на удаление: {st.pending_count()}.")
 
+    tasks = [
+        asyncio.create_task(run_worker(bot), name="deletion-worker"),
+        asyncio.create_task(run_watchdog(bot), name="watchdog"),
+    ]
     try:
         await dp.start_polling(bot)
     finally:
-        scheduler.shutdown(wait=False)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await bot.session.close()
 
 
