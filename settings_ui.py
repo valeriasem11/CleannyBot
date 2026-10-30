@@ -11,7 +11,15 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 import storage as st
 import utils
-from utils import check_admin, fmt_local, format_duration, offset_label
+from utils import (
+    CMD_MODE_LABELS,
+    CMD_MODE_ORDER,
+    check_admin,
+    cmd_mode,
+    fmt_local,
+    format_duration,
+    offset_label,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -19,7 +27,6 @@ router = Router()
 DELAY_PRESETS = ((60, "1 мин"), (300, "5 мин"), (900, "15 мин"), (3600, "1 ч"))
 PAUSE_PRESETS = ((10, "10 мин"), (60, "1 ч"), (480, "8 ч"))
 TOGGLES = {
-    "clean_commands": "🧹 Команды к ботам",
     "clean_via": "📎 Сообщения через inline",
     "tidy": "🧽 Убирать мои ответы",
 }
@@ -56,9 +63,14 @@ def render(chat_id: int):
     ]
     if opts["night_start"] and opts["night_end"]:
         lines.append(f"🌙 Ночью {opts['night_start']}–{opts['night_end']}: {'не удаляю' if opts['night_action'] == 'skip' else 'удаляю быстро'}")
+    cmd_label = CMD_MODE_LABELS[cmd_mode(opts)]
+    lines.append(f"🧹 Удаление команд: {cmd_label}")
     for key, title in TOGGLES.items():
         lines.append(f"{title}: {onoff(key)}")
     lines.append(f"🕒 Часовой пояс: {offset_label(offset)}")
+    phrases = st.phrase_list(chat_id)
+    if phrases:
+        lines.append(f"🔤 Фразы для удаления: {len(phrases)} (/phrases list)")
 
     whitelist = st.list_get("whitelist", chat_id)
     targets = st.list_get("targets", chat_id)
@@ -75,6 +87,7 @@ def render(chat_id: int):
         [_btn(("✅ " if delay == sec else "") + label, "delay", str(sec)) for sec, label in DELAY_PRESETS],
         [_btn(f"⏸ {label}", "pause", str(minutes)) for minutes, label in PAUSE_PRESETS] + [_btn("▶️ Снять", "pause", "off")],
     ]
+    rows.append([_btn(f"🧹 Команды: {cmd_label}", "cmdmode")])
     for key, title in TOGGLES.items():
         rows.append([_btn(f"{title}: {onoff(key)}", "toggle", key)])
     rows.append([_btn("🎯 Режим: " + ("все" if opts["mode"] == "all" else "только цели"), "toggle", "mode")])
@@ -119,6 +132,10 @@ async def on_settings_button(cb: CallbackQuery, callback_data: St) -> None:
             st.clear_pause(chat_id)
         elif value.isdigit():
             st.set_pause(chat_id, st.utcnow() + timedelta(minutes=int(value)))
+    elif action == "cmdmode":
+        current = cmd_mode(st.get_options(chat_id))
+        nxt = CMD_MODE_ORDER[(CMD_MODE_ORDER.index(current) + 1) % len(CMD_MODE_ORDER)]
+        st.set_option(chat_id, "clean_commands", nxt)
     elif action == "toggle":
         if value in TOGGLES:
             opts = st.get_options(chat_id)

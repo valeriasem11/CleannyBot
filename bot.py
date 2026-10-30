@@ -11,6 +11,7 @@ from chat_tracker import ChatTrackerMiddleware
 from chat_tracker import router as chat_tracker_router
 from commands import router as commands_router
 from config import BOT_TOKEN
+from handlers import CleanupMiddleware
 from handlers import router as handlers_router
 from queue_worker import run_worker
 from settings_ui import router as settings_router
@@ -30,6 +31,7 @@ async def main() -> None:
     dp = Dispatcher()
 
     dp.update.outer_middleware(ChatTrackerMiddleware())
+    dp.message.outer_middleware(CleanupMiddleware())
     dp.errors.register(on_error)
 
     # Порядок важен: команды и настройки раньше общего слежения за группами

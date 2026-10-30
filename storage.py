@@ -3,6 +3,7 @@
 Работает и на PostgreSQL (боевой режим), и на SQLite (локальная разработка).
 Все времена хранятся в UTC (naive datetime).
 """
+import time
 from datetime import datetime, timezone
 
 from sqlalchemy import bindparam, create_engine, text
@@ -35,6 +36,9 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS chat_bot_delays ("
     " chat_id BIGINT NOT NULL, bot_id BIGINT NOT NULL, username TEXT,"
     " delay_seconds INTEGER NOT NULL, PRIMARY KEY (chat_id, bot_id))",
+    "CREATE TABLE IF NOT EXISTS chat_phrases ("
+    " chat_id BIGINT NOT NULL, phrase_key TEXT NOT NULL, phrase TEXT NOT NULL,"
+    " added_at TIMESTAMP NOT NULL, PRIMARY KEY (chat_id, phrase_key))",
     "CREATE TABLE IF NOT EXISTS chat_pause ("
     " chat_id BIGINT PRIMARY KEY, paused_until TIMESTAMP NOT NULL)",
     "CREATE TABLE IF NOT EXISTS known_chats ("
@@ -77,7 +81,18 @@ DEFAULT_OPTIONS = {
 }
 
 
+# Настройки и фразы читаются на каждое сообщение в группе, поэтому держим их
+# в памяти 20 секунд; при любом изменении кэш чата сбрасывается сразу.
+_CACHE_TTL = 20.0
+_OPTS_CACHE: dict = {}
+_PHRASE_CACHE: dict = {}
+
+
 def get_options(chat_id: int) -> dict:
+    now = time.monotonic()
+    hit = _OPTS_CACHE.get(chat_id)
+    if hit and now - hit[0] < _CACHE_TTL:
+        return dict(hit[1])
     opts = dict(DEFAULT_OPTIONS)
     with engine.begin() as conn:
         rows = conn.execute(
@@ -86,7 +101,8 @@ def get_options(chat_id: int) -> dict:
         ).fetchall()
     for key, value in rows:
         opts[key] = value
-    return opts
+    _OPTS_CACHE[chat_id] = (now, opts)
+    return dict(opts)
 
 
 def set_option(chat_id: int, key: str, value: str) -> None:
@@ -99,10 +115,75 @@ def set_option(chat_id: int, key: str, value: str) -> None:
             ),
             {"c": chat_id, "k": key, "v": value},
         )
+    _OPTS_CACHE.pop(chat_id, None)
 
 
 def option_on(opts: dict, key: str) -> bool:
     return opts.get(key) == "1"
+
+
+# ---------- Фразы для удаления ----------
+
+MAX_PHRASES = 50
+MIN_PHRASE_LEN = 3
+MAX_PHRASE_LEN = 100
+
+
+def phrase_add(chat_id: int, phrase: str) -> str:
+    """Возвращает 'ok', 'exists' или 'limit'."""
+    key = phrase.casefold()
+    current = phrase_list(chat_id)
+    if any(p.casefold() == key for p in current):
+        return "exists"
+    if len(current) >= MAX_PHRASES:
+        return "limit"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO chat_phrases (chat_id, phrase_key, phrase, added_at)"
+                " VALUES (:c, :k, :p, :t)"
+            ),
+            {"c": chat_id, "k": key, "p": phrase, "t": utcnow()},
+        )
+    _PHRASE_CACHE.pop(chat_id, None)
+    return "ok"
+
+
+def phrase_remove(chat_id: int, phrase: str) -> bool:
+    with engine.begin() as conn:
+        res = conn.execute(
+            text("DELETE FROM chat_phrases WHERE chat_id = :c AND phrase_key = :k"),
+            {"c": chat_id, "k": phrase.casefold()},
+        )
+    _PHRASE_CACHE.pop(chat_id, None)
+    return res.rowcount > 0
+
+
+def phrase_list(chat_id: int) -> list:
+    """Фразы чата в порядке добавления (как их ввели)."""
+    now = time.monotonic()
+    hit = _PHRASE_CACHE.get(chat_id)
+    if hit and now - hit[0] < _CACHE_TTL:
+        return list(hit[1])
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("SELECT phrase FROM chat_phrases WHERE chat_id = :c ORDER BY added_at, phrase_key"),
+            {"c": chat_id},
+        ).fetchall()
+    phrases = [r[0] for r in rows]
+    _PHRASE_CACHE[chat_id] = (now, phrases)
+    return list(phrases)
+
+
+def phrase_match(chat_id: int, message_text: str) -> str | None:
+    """Первая фраза чата, которая входит в текст (без учёта регистра), либо None."""
+    if not message_text:
+        return None
+    haystack = message_text.casefold()
+    for phrase in phrase_list(chat_id):
+        if phrase.casefold() in haystack:
+            return phrase
+    return None
 
 
 # ---------- Общая задержка чата ----------
@@ -418,6 +499,8 @@ def count_deleted(chat_id: int | None, since: datetime) -> int:
 
 def top_bots(chat_id: int | None, since: datetime, limit: int = 5) -> list:
     where, params = _log_filter(chat_id, since)
+    # удаления по фразам и команд без известного бота в топ не попадают
+    where += " AND (username IS NOT NULL OR bot_id IS NOT NULL)"
     with engine.begin() as conn:
         rows = conn.execute(
             text(

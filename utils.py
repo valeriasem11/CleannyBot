@@ -14,6 +14,35 @@ GROUP_TYPES = ("group", "supergroup")
 ANON_ADMIN_ID = 1087968824
 IGNORED_BOT_IDS = {ANON_ADMIN_ID, 136817688, 777000}
 
+# Режимы удаления команд людей (опция чата clean_commands)
+CMD_MODE_ORDER = ("0", "1", "smart", "all")
+CMD_MODE_LABELS = {"0": "выкл", "1": "только с @", "smart": "умный", "all": "все"}
+
+# Собственные команды Cleanny: их в режимах smart/all не трогаем
+OWN_COMMANDS = frozenset({
+    "start", "help", "status", "settings", "setdelay", "botdelay", "pause", "resume",
+    "keep", "whitelist", "targets", "mode", "cleancmds", "cleanvia", "tidy", "night",
+    "timezone", "stats", "chats", "phrases",
+})
+
+_CMD_NAME_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
+
+
+def cmd_mode(opts: dict) -> str:
+    value = opts.get("clean_commands", "0")
+    return value if value in CMD_MODE_LABELS else "0"
+
+
+def parse_command(text: str | None):
+    """'/work@SomeBot 10' -> ('work', 'SomeBot'); '/casino 10' -> ('casino', None); иначе None."""
+    if not text or not text.startswith("/"):
+        return None
+    first = text.split(maxsplit=1)[0][1:]
+    name, _, target = first.partition("@")
+    if not _CMD_NAME_RE.fullmatch(name):
+        return None
+    return name.lower(), (target or None)
+
 
 # ---------- Админы ----------
 

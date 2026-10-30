@@ -8,7 +8,9 @@ from aiogram.types import Message
 
 import storage as st
 from config import DEFAULT_UTC_OFFSET_HOURS, OWNER_USER_ID, TIDY_DELAY_SECONDS, WHITELIST_BOT_IDS
+from utils import cmd_mode as clean_cmd_mode  # не путать с обработчиком /mode ниже
 from utils import (
+    CMD_MODE_LABELS,
     GROUP_TYPES,
     UNKNOWN_BOT_TEXT,
     check_admin,
@@ -58,7 +60,8 @@ HELP_TEXT = (
     "/whitelist add|remove|list — боты, которых не трогаем\n"
     "/mode all|only — чистить всех или только ботов из /targets\n"
     "/targets add|remove|list — список ботов для режима only\n"
-    "/cleancmds on|off — удалять и команды людей к ботам (/cmd@bot)\n"
+    "/cleancmds off|on|smart|all — какие команды людей удалять (подробнее: /cleancmds)\n"
+    "/phrases add|remove|list — удалять любые сообщения, содержащие заданный текст\n"
     "/cleanvia on|off — удалять сообщения, отправленные через inline-режим\n"
     f"/tidy on|off — убирать мои ответы и команды админов через ~{TIDY_DELAY_SECONDS} сек\n"
     "/night 23:00-08:00 [skip|fast] | off — ночной режим\n"
@@ -106,7 +109,8 @@ async def cmd_status(message: Message) -> None:
         action = "не удаляю" if opts["night_action"] == "skip" else f"удаляю быстро (~{format_duration(30)})"
         lines.append(f"🌙 Ночной режим {opts['night_start']}–{opts['night_end']}: {action}")
     lines += [
-        f"🧹 Команды к ботам: {onoff('clean_commands')}",
+        f"🧹 Удаление команд: {CMD_MODE_LABELS[clean_cmd_mode(opts)]}",
+        f"🔤 Фраз для удаления: {len(st.phrase_list(chat_id))}",
         f"📎 Сообщения через inline-режим: {onoff('clean_via')}",
         f"🧽 Убирать мои ответы: {onoff('tidy')}",
         f"🕒 Часовой пояс: {offset_label(offset)}",
@@ -342,12 +346,101 @@ async def _toggle(message: Message, command: CommandObject, key: str, title: str
     await reply(message, f"{title}: {'включено ✅' if new else 'выключено ⛔️'}")
 
 
+CMD_MODE_WORDS = {
+    "off": "0", "0": "0", "выкл": "0",
+    "on": "1", "1": "1", "вкл": "1",
+    "smart": "smart", "умный": "smart",
+    "all": "all", "все": "all", "всё": "all",
+}
+
+CMD_MODE_HELP = (
+    "/cleancmds off — не удалять команды\n"
+    "/cleancmds on — только команды с @, например /work@бот\n"
+    "/cleancmds smart — ещё и команды без @, после которых сразу ответил бот "
+    "(удаляются вместе с его ответом)\n"
+    "/cleancmds all — все команды людей, кроме моих. Удалятся даже /ban и подобные, "
+    "бот-адресат неизвестен"
+)
+
+
 @router.message(Command("cleancmds"))
 async def cmd_cleancmds(message: Message, command: CommandObject) -> None:
-    await _toggle(
-        message, command, "clean_commands", "Удаление команд к ботам",
-        "Удаляются команды вида /команда@бот (с @). Команды без @ и обычные слова вроде «ферма» определить нельзя.",
-    )
+    if not await check_admin(message):
+        return
+    chat_id = message.chat.id
+    mode = CMD_MODE_WORDS.get((command.args or "").strip().lower())
+    if mode is None:
+        current = CMD_MODE_LABELS[clean_cmd_mode(st.get_options(chat_id))]
+        await reply(message, f"🧹 Сейчас: <b>{current}</b>.\n\n{CMD_MODE_HELP}")
+        return
+    st.set_option(chat_id, "clean_commands", mode)
+    await reply(message, f"🧹 Удаление команд: <b>{CMD_MODE_LABELS[mode]}</b> ✅")
+
+
+# ---------- Фразы ----------
+
+PHRASES_USAGE = (
+    "<b>Фразы для удаления</b>\n"
+    "Любое сообщение, в котором встречается фраза (регистр не важен), будет удалено "
+    "через общую задержку чата — от кого бы оно ни было, даже от админа.\n\n"
+    "/phrases add /casino — добавить фразу\n"
+    "/phrases remove /casino — убрать (или по номеру: /phrases remove 2)\n"
+    "/phrases list — показать список\n\n"
+    f"Длина фразы — от {st.MIN_PHRASE_LEN} до {st.MAX_PHRASE_LEN} символов, не больше {st.MAX_PHRASES} фраз на чат. "
+    "Сообщение «/casino 10» удалится по фразе «/casino»."
+)
+
+
+@router.message(Command("phrases"))
+async def cmd_phrases(message: Message, command: CommandObject) -> None:
+    if not await check_admin(message):
+        return
+    chat_id = message.chat.id
+    action, _, rest = (command.args or "").strip().partition(" ")
+    action, rest = action.lower(), rest.strip()
+
+    if action == "list":
+        phrases = st.phrase_list(chat_id)
+        if not phrases:
+            await reply(message, "Список фраз пуст. Добавить: /phrases add текст")
+            return
+        lines = "\n".join(f"{i}. <code>{html.escape(p)}</code>" for i, p in enumerate(phrases, 1))
+        await reply(message, f"<b>Фразы для удаления ({len(phrases)}):</b>\n{lines}")
+        return
+
+    if action == "add":
+        if len(rest) < st.MIN_PHRASE_LEN:
+            await reply(message, f"Фраза слишком короткая — минимум {st.MIN_PHRASE_LEN} символа, иначе удалится слишком много.")
+            return
+        if len(rest) > st.MAX_PHRASE_LEN:
+            await reply(message, f"Фраза слишком длинная — максимум {st.MAX_PHRASE_LEN} символов.")
+            return
+        result = st.phrase_add(chat_id, rest)
+        shown = html.escape(rest)
+        if result == "exists":
+            await reply(message, f"Фраза <code>{shown}</code> уже в списке.")
+        elif result == "limit":
+            await reply(message, f"Достигнут лимит — {st.MAX_PHRASES} фраз на чат. Уберите ненужные: /phrases remove номер")
+        else:
+            await reply(message, f"✅ Теперь сообщения со словами <code>{shown}</code> будут удаляться.")
+        return
+
+    if action in ("remove", "del", "delete"):
+        if not rest:
+            await reply(message, "Укажите фразу или её номер из /phrases list.")
+            return
+        target = rest
+        if rest.isdigit():
+            phrases = st.phrase_list(chat_id)
+            if 1 <= int(rest) <= len(phrases):
+                target = phrases[int(rest) - 1]
+        if st.phrase_remove(chat_id, target):
+            await reply(message, f"🗑 Фраза <code>{html.escape(target)}</code> убрана.")
+        else:
+            await reply(message, "Такой фразы нет в списке. Посмотреть: /phrases list")
+        return
+
+    await reply(message, PHRASES_USAGE)
 
 
 @router.message(Command("cleanvia"))
